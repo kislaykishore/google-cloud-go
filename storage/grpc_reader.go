@@ -445,6 +445,11 @@ func (r *gRPCReadObjectReader) WriteTo(w io.Writer) (int64, error) {
 		})
 		r.seen += int64(written)
 		if err != nil {
+			if !r.currMsg.done {
+				r.currMsg.done = true
+				r.currMsg.databufs.Free()
+				r.currMsg.databufs = nil
+			}
 			r.currMsg = nil
 			return r.seen - alreadySeen, err
 		}
@@ -494,6 +499,12 @@ func (r *gRPCReadObjectReader) WriteTo(w io.Writer) (int64, error) {
 		})
 		r.seen += int64(written)
 		if err != nil {
+			if !r.currMsg.done {
+				r.currMsg.done = true
+				r.currMsg.databufs.Free()
+				r.currMsg.databufs = nil
+			}
+			r.currMsg = nil
 			return r.seen - alreadySeen, err
 		}
 		if r.currMsg != nil && r.currMsg.done {

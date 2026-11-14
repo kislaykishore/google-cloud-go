@@ -17,6 +17,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"hash/crc32"
 	"io"
 	"sync"
@@ -317,6 +318,274 @@ func TestReadVectored_ZeroCopy_SingleAndMultiBuffer(t *testing.T) {
 	}
 }
 
+func TestReadVectored_InterleavedWithReadAndWriteTo(t *testing.T) {
+	payload1 := []byte("0123456789abcdefghijklmnopqrstuvwxyzABCD")
+	payload2 := []byte("EFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	wantAll := append(append([]byte(nil), payload1...), payload2...)
+	totalLen := int64(len(wantAll))
+
+	for _, mode := range []string{"ReadObject", "BidiReadObject"} {
+		for _, splitSize := range []int{0, 7} {
+			t.Run(mode+"/split_"+string(rune('0'+splitSize)), func(t *testing.T) {
+				pool := &trackingBufferPool{}
+				var sr *Reader
+				var roReader *gRPCReadObjectReader
+				var bidiReader *gRPCReader
+				if mode == "ReadObject" {
+					msgs := []mem.BufferSlice{
+						makeReadObjectMsg(t, pool, payload1, nil, splitSize),
+						makeReadObjectMsg(t, pool, payload2, nil, splitSize),
+					}
+					sr, roReader = newTestReadObjectReader(t, msgs, totalLen, false, 0)
+				} else {
+					msgs := []mem.BufferSlice{
+						makeBidiReadMsg(t, pool, defaultReadID, 0, payload1, nil, false, splitSize),
+						makeBidiReadMsg(t, pool, defaultReadID, int64(len(payload1)), payload2, nil, true, splitSize),
+					}
+					sr, bidiReader = newTestBidiReader(t, msgs, totalLen, false, 0)
+				}
+
+				getState := func() (seen int64, currBuf int, currOff uint64, done bool) {
+					if roReader != nil {
+						if roReader.currMsg == nil {
+							return roReader.seen, -1, 0, true
+						}
+						off := roReader.currMsg.dataOffsets
+						return roReader.seen, off.currBuf, off.currOff, roReader.currMsg.done
+					}
+					if bidiReader.currMsg == nil {
+						return bidiReader.seen, -1, 0, true
+					}
+					off := bidiReader.currMsg.dataOffsets[defaultReadID]
+					return bidiReader.seen, off.currBuf, off.currOff, bidiReader.currMsg.done
+				}
+
+				assertAccounting := func(step string, wantSeen int64) {
+					t.Helper()
+					seen, _, _, _ := getState()
+					if seen != wantSeen {
+						t.Fatalf("%s: seen = %d, want %d", step, seen, wantSeen)
+					}
+					if sr.Remain() != totalLen-wantSeen {
+						t.Fatalf("%s: Remain() = %d, want %d", step, sr.Remain(), totalLen-wantSeen)
+					}
+					if sr.bytesRead != wantSeen {
+						t.Fatalf("%s: bytesRead = %d, want %d", step, sr.bytesRead, wantSeen)
+					}
+				}
+
+				var got []byte
+				var releases []func()
+
+				// Step 1: sr.Read(p1) reads initial bytes of msg1, leaving currMsg active.
+				p1 := make([]byte, 4)
+				n1, err := sr.Read(p1)
+				if err != nil || n1 == 0 {
+					t.Fatalf("step 1 Read: n=%d, err=%v", n1, err)
+				}
+				got = append(got, p1[:n1]...)
+				assertAccounting("after step 1 Read", int64(len(got)))
+				_, bufAfter1, offAfter1, done1 := getState()
+				if done1 {
+					t.Fatalf("step 1: expected currMsg.done == false after partial Read")
+				}
+
+				// Step 2: sr.ReadVectored(buf1) on the SAME currMsg (msg1).
+				buf1 := bytes.Repeat([]byte{'X'}, 12)
+				slices1, n2, rel1, err := sr.ReadVectored(buf1)
+				if err != nil || n2 != 12 || slices1 == nil || rel1 == nil {
+					t.Fatalf("step 2 ReadVectored: n=%d, slices!=nil:%v, rel!=nil:%v, err=%v", n2, slices1 != nil, rel1 != nil, err)
+				}
+				assertCappedSlices(t, slices1)
+				got = append(got, flattenSlices(slices1)...)
+				releases = append(releases, rel1)
+				assertAccounting("after step 2 ReadVectored", int64(len(got)))
+				_, bufAfter2, offAfter2, done2 := getState()
+				if done2 {
+					t.Fatalf("step 2: expected currMsg.done == false after partial ReadVectored")
+				}
+				if bufAfter2 < bufAfter1 || (bufAfter2 == bufAfter1 && offAfter2 <= offAfter1) {
+					t.Fatalf("step 2: dataOffsets did not advance: (%d,%d) -> (%d,%d)", bufAfter1, offAfter1, bufAfter2, offAfter2)
+				}
+
+				// Step 3: sr.Read(p2) again on the SAME currMsg (msg1) after ReadVectored.
+				p2 := make([]byte, 5)
+				n3, err := sr.Read(p2)
+				if err != nil || n3 == 0 {
+					t.Fatalf("step 3 Read: n=%d, err=%v", n3, err)
+				}
+				got = append(got, p2[:n3]...)
+				assertAccounting("after step 3 Read", int64(len(got)))
+				_, bufAfter3, offAfter3, done3 := getState()
+				if done3 {
+					t.Fatalf("step 3: expected currMsg.done == false after second partial Read")
+				}
+				if bufAfter3 < bufAfter2 || (bufAfter3 == bufAfter2 && offAfter3 <= offAfter2) {
+					t.Fatalf("step 3: dataOffsets did not advance: (%d,%d) -> (%d,%d)", bufAfter2, offAfter2, bufAfter3, offAfter3)
+				}
+
+				// Step 4: sr.ReadVectored(buf2) spanning the remainder of msg1 and into msg2.
+				remInMsg1 := len(payload1) - len(got)
+				spanReadLen := remInMsg1 + 10
+				buf2 := bytes.Repeat([]byte{'Y'}, spanReadLen)
+				slices2, n4, rel2, err := sr.ReadVectored(buf2)
+				if err != nil || n4 != spanReadLen || slices2 == nil || rel2 == nil {
+					t.Fatalf("step 4 ReadVectored across boundary: n=%d (want %d), err=%v", n4, spanReadLen, err)
+				}
+				assertCappedSlices(t, slices2)
+				got = append(got, flattenSlices(slices2)...)
+				releases = append(releases, rel2)
+				assertAccounting("after step 4 ReadVectored across msgs", int64(len(got)))
+				_, bufAfter4, offAfter4, done4 := getState()
+				if done4 {
+					t.Fatalf("step 4: expected msg2 currMsg.done == false")
+				}
+
+				// Step 5: sr.Read(p3) on msg2 after ReadVectored.
+				p3 := make([]byte, 4)
+				n5, err := sr.Read(p3)
+				if err != nil || n5 == 0 {
+					t.Fatalf("step 5 Read on msg2: n=%d, err=%v", n5, err)
+				}
+				got = append(got, p3[:n5]...)
+				assertAccounting("after step 5 Read on msg2", int64(len(got)))
+				_, bufAfter5, offAfter5, done5 := getState()
+				if done5 {
+					t.Fatalf("step 5: expected msg2 currMsg.done == false")
+				}
+				if bufAfter5 < bufAfter4 || (bufAfter5 == bufAfter4 && offAfter5 <= offAfter4) {
+					t.Fatalf("step 5: msg2 dataOffsets did not advance: (%d,%d) -> (%d,%d)", bufAfter4, offAfter4, bufAfter5, offAfter5)
+				}
+
+				// Step 6: sr.WriteTo(&outBuf) drains the remaining bytes of msg2 to EOF.
+				var outBuf bytes.Buffer
+				wantWritten := totalLen - int64(len(got))
+				written, err := sr.WriteTo(&outBuf)
+				if err != nil || written != wantWritten {
+					t.Fatalf("step 6 WriteTo: written=%d (want %d), err=%v", written, wantWritten, err)
+				}
+				got = append(got, outBuf.Bytes()...)
+				assertAccounting("after step 6 WriteTo", totalLen)
+
+				if !bytes.Equal(got, wantAll) {
+					t.Errorf("interleaved payload = %q, want %q", got, wantAll)
+				}
+
+				// Pinned buffers from ReadVectored must still be active until released.
+				if pool.active.Load() == 0 {
+					t.Fatalf("expected active buffers > 0 before calling release callbacks")
+				}
+				for _, rel := range releases {
+					rel()
+				}
+				if err := sr.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				if active := pool.active.Load(); active != 0 {
+					t.Errorf("active buffers after release & Close = %d, want 0 (got=%d, put=%d)", active, pool.got.Load(), pool.put.Load())
+				}
+			})
+		}
+	}
+}
+
+type failingWriter struct {
+	failAfter int
+	written   int
+	err       error
+}
+
+func (fw *failingWriter) Write(p []byte) (int, error) {
+	if fw.written+len(p) > fw.failAfter {
+		n := fw.failAfter - fw.written
+		if n < 0 {
+			n = 0
+		}
+		fw.written += n
+		return n, fw.err
+	}
+	fw.written += len(p)
+	return len(p), nil
+}
+
+func TestWriteTo_MidMessageErrorFreesBuffers(t *testing.T) {
+	payload1 := []byte("0123456789abcdef0123456789ABCDEF")
+	payload2 := []byte("fedcba9876543210FEDCBA9876543210")
+	totalLen := int64(len(payload1) + len(payload2))
+	writeErr := errors.New("simulated writer failure")
+
+	for _, mode := range []string{"ReadObject", "BidiReadObject"} {
+		for _, splitSize := range []int{0, 7} {
+			// Case 1: WriteTo fails while draining an already partially-read currMsg.
+			t.Run(mode+"/PartialCurrMsg/split_"+string(rune('0'+splitSize)), func(t *testing.T) {
+				pool := &trackingBufferPool{}
+				var sr *Reader
+				if mode == "ReadObject" {
+					msgs := []mem.BufferSlice{makeReadObjectMsg(t, pool, payload1, nil, splitSize)}
+					sr, _ = newTestReadObjectReader(t, msgs, int64(len(payload1)), false, 0)
+				} else {
+					msgs := []mem.BufferSlice{makeBidiReadMsg(t, pool, defaultReadID, 0, payload1, nil, true, splitSize)}
+					sr, _ = newTestBidiReader(t, msgs, int64(len(payload1)), false, 0)
+				}
+
+				// Partially consume msg1 via Read so r.currMsg != nil && !r.currMsg.done.
+				p := make([]byte, 3)
+				if n, err := sr.Read(p); err != nil || n == 0 {
+					t.Fatalf("Read: n=%d, err=%v", n, err)
+				}
+
+				fw := &failingWriter{failAfter: 2, err: writeErr}
+				_, err := sr.WriteTo(fw)
+				if !errors.Is(err, writeErr) {
+					t.Fatalf("WriteTo err = %v, want %v", err, writeErr)
+				}
+				// Unread currMsg.databufs must be freed immediately upon WriteTo error.
+				if active := pool.active.Load(); active != 0 {
+					t.Errorf("active buffers after WriteTo error on partial currMsg = %d, want 0", active)
+				}
+				// Subsequent Close must be safe (no double-free).
+				_ = sr.Close()
+				if active := pool.active.Load(); active != 0 {
+					t.Errorf("active buffers after Close = %d, want 0", active)
+				}
+			})
+
+			// Case 2: WriteTo fails on a message received inside WriteTo's recv loop.
+			t.Run(mode+"/LoopRecvMsg/split_"+string(rune('0'+splitSize)), func(t *testing.T) {
+				pool := &trackingBufferPool{}
+				var sr *Reader
+				if mode == "ReadObject" {
+					msgs := []mem.BufferSlice{
+						makeReadObjectMsg(t, pool, payload1, nil, splitSize),
+						makeReadObjectMsg(t, pool, payload2, nil, splitSize),
+					}
+					sr, _ = newTestReadObjectReader(t, msgs, totalLen, false, 0)
+				} else {
+					msgs := []mem.BufferSlice{
+						makeBidiReadMsg(t, pool, defaultReadID, 0, payload1, nil, false, splitSize),
+						makeBidiReadMsg(t, pool, defaultReadID, int64(len(payload1)), payload2, nil, true, splitSize),
+					}
+					sr, _ = newTestBidiReader(t, msgs, totalLen, false, 0)
+				}
+
+				// Allow msg1 to succeed completely and fail 2 bytes into msg2.
+				fw := &failingWriter{failAfter: len(payload1) + 2, err: writeErr}
+				_, err := sr.WriteTo(fw)
+				if !errors.Is(err, writeErr) {
+					t.Fatalf("WriteTo err = %v, want %v", err, writeErr)
+				}
+				if active := pool.active.Load(); active != 0 {
+					t.Errorf("active buffers after WriteTo error in recv loop = %d, want 0", active)
+				}
+				_ = sr.Close()
+				if active := pool.active.Load(); active != 0 {
+					t.Errorf("active buffers after Close = %d, want 0", active)
+				}
+			})
+		}
+	}
+}
+
 func TestReadVectored_CloseMidMessageFreesUnreadBuffers(t *testing.T) {
 	payload := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
 	for _, mode := range []string{"ReadObject", "BidiReadObject"} {
@@ -546,7 +815,7 @@ func TestReadVectored_NonGRPCReaderAndRemainAccounting(t *testing.T) {
 	pool := &trackingBufferPool{}
 	msgs := []mem.BufferSlice{makeBidiReadMsg(t, pool, defaultReadID, 0, payload, nil, true, 0)}
 	srUnfin, _ := newTestBidiReader(t, msgs, int64(len(payload)), false, 0)
-	srUnfin.unfinalized = true
+	srUnfin.Attrs.Unfinalized = true
 	srUnfin.remain = -1
 
 	buf2 := make([]byte, len(payload))
@@ -761,7 +1030,7 @@ func TestZeroCopyWriter_DecoderAndMRD(t *testing.T) {
 
 		// processSessionResult writes to zcw via writeToAndUpdateCRC and defers decoder.databufs.Free().
 		mgr.processSessionResult(mrdSessionResult{id: 0, decoder: decoder})
-		mgr.callbackWg.Wait()
+		mgr.callbacks.wait()
 
 		if !cbCalled || cbErr != nil || cbOffset != 42 || cbLength != int64(len(payload1)) {
 			t.Fatalf("callback = (called=%v, off=%d, len=%d, err=%v)", cbCalled, cbOffset, cbLength, cbErr)

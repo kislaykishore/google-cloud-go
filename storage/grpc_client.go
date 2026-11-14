@@ -1896,6 +1896,8 @@ func (r *gRPCReader) WriteTo(w io.Writer) (int64, error) {
 			r.currMsg.databufs.Free()
 			r.currMsg.databufs = nil
 			if err != nil {
+				r.currMsg.done = true
+				r.currMsg = nil
 				return r.seen - alreadySeen, err
 			}
 			if r.currMsg.done {
@@ -2326,6 +2328,7 @@ func (d *readResponseDecoder) writeToAndUpdateCRC(w io.Writer, readID int64, upd
 
 	// Loop from the current buffer to the ending buffer for this specific data range.
 	for i := offsets.currBuf; i <= offsets.endBuf; i++ {
+		offsets.currBuf = i
 		if i < 0 || i >= len(d.databufs) {
 			continue
 		}
@@ -2354,15 +2357,22 @@ func (d *readResponseDecoder) writeToAndUpdateCRC(w io.Writer, readID int64, upd
 			n, err = w.Write(dataSlice)
 		}
 		totalWritten += int64(n)
-		offsets.currOff = 0 // moving to the next buffer, currOff resets to zero.
 		if updateCRC != nil {
 			updateCRC(dataSlice[:n])
 		}
 		if err != nil {
+			offsets.currOff = start + uint64(n)
+			d.dataOffsets[readID] = offsets
 			// Return immediately on a write error.
 			return totalWritten, true, err
 		}
+		if i == offsets.endBuf {
+			offsets.currOff = end
+		} else {
+			offsets.currOff = 0 // moving to the next buffer, currOff resets to zero.
+		}
 	}
+	d.dataOffsets[readID] = offsets
 	d.done = true
 
 	return totalWritten, true, nil
