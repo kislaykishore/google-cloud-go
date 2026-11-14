@@ -29,7 +29,48 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/mem"
 )
+
+// ZeroCopyWriter is an optional interface that an io.Writer passed to
+// MultiRangeDownloader.Add may implement to receive zero-copy slices
+// backed by gRPC mem.Buffer references instead of copying payload bytes.
+type ZeroCopyWriter interface {
+	io.Writer
+	WriteZeroCopy(p []byte, buf mem.Buffer) (int, error)
+}
+
+type vectoredReader interface {
+	readVectored(sr *Reader, buf []byte) (slices [][]byte, n int, release func(), err error)
+}
+
+type vectoredReadState struct {
+	slices   [][]byte
+	held     []mem.Buffer
+	callback func()
+}
+
+var vectoredReadStatePool = sync.Pool{
+	New: func() any {
+		return &vectoredReadState{
+			slices: make([][]byte, 0, 72),
+			held:   make([]mem.Buffer, 0, 72),
+		}
+	},
+}
+
+func (s *vectoredReadState) release() {
+	for i := range s.held {
+		s.held[i].Free()
+		s.held[i] = nil
+	}
+	s.held = s.held[:0]
+	for i := range s.slices {
+		s.slices[i] = nil
+	}
+	s.slices = s.slices[:0]
+	vectoredReadStatePool.Put(s)
+}
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -436,6 +477,37 @@ func (r *Reader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	r.recordRead(int64(n), err)
 	return n, err
+}
+
+func (r *Reader) readFull(buf []byte) (int, error) {
+	n, err := io.ReadFull(r, buf)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return n, err
+}
+
+// ReadVectored reads up to len(buf) bytes from the Reader.
+//
+// When the Reader is backed by a gRPC stream and checksum verification or
+// buffered leftovers are not active, ReadVectored returns zero-copy byte slices
+// referencing the underlying gRPC mem.Buffer allocations without copying payload
+// bytes into buf. In that case, slices is non-nil and the caller must invoke
+// release when finished with slices so the underlying buffers can be returned
+// to their pool.
+//
+// When the Reader is not backed by gRPC or must compute checksums, ReadVectored
+// falls back to reading into buf[:n] via io.ReadFull (normalizing
+// io.ErrUnexpectedEOF to io.EOF) and returns slices == nil and release == nil.
+func (r *Reader) ReadVectored(buf []byte) (slices [][]byte, n int, release func(), err error) {
+	if len(buf) == 0 {
+		return nil, 0, nil, nil
+	}
+	if vr, ok := r.reader.(vectoredReader); ok {
+		return vr.readVectored(r, buf)
+	}
+	n, err = r.readFull(buf)
+	return nil, n, nil, err
 }
 
 // WriteTo writes all the data from the Reader to w. Fulfills the io.WriterTo interface.

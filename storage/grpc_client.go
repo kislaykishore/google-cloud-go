@@ -1817,6 +1817,7 @@ func (r *gRPCReader) Read(p []byte) (int, error) {
 			// If we are done reading the current msg, validate chunk checksum and free buffers.
 			if r.currMsg.done {
 				r.currMsg.databufs.Free()
+				r.currMsg.databufs = nil
 				if err := r.checkAndResetChunkCRC(); err != nil {
 					return n, err
 				}
@@ -1893,6 +1894,7 @@ func (r *gRPCReader) WriteTo(w io.Writer) (int64, error) {
 			r.seen += written
 			// We have processed the message, so free the buffer
 			r.currMsg.databufs.Free()
+			r.currMsg.databufs = nil
 			if err != nil {
 				return r.seen - alreadySeen, err
 			}
@@ -1942,6 +1944,11 @@ func (r *gRPCReader) WriteTo(w io.Writer) (int64, error) {
 // Close drains a completed stream (bounded by defaultStreamDrainTimeout) so
 // the RPC ends cleanly, then cancels the context and frees buffers.
 func (r *gRPCReader) Close() error {
+	if r.currMsg != nil && !r.currMsg.done {
+		r.currMsg.done = true
+		r.currMsg.databufs.Free()
+		r.currMsg.databufs = nil
+	}
 	if r.stream != nil && ((r.finalized || r.negativeOffset) && r.size == r.seen || r.zeroRange) {
 		drainStreamOnCompletion(r.cancel, r.stream)
 	}
@@ -1952,6 +1959,117 @@ func (r *gRPCReader) Close() error {
 	r.stream = nil
 	r.currMsg = nil
 	return nil
+}
+
+func (r *gRPCReader) readVectored(sr *Reader, buf []byte) (slices [][]byte, n int, release func(), err error) {
+	want := len(buf)
+	if want == 0 {
+		return nil, 0, nil, nil
+	}
+	if r.checkCRC || r.chunkCRCPresent || len(r.leftovers) > 0 {
+		n, err = sr.readFull(buf)
+		return nil, n, nil, err
+	}
+
+	state := vectoredReadStatePool.Get().(*vectoredReadState)
+	if state.callback == nil {
+		state.callback = state.release
+	}
+	totalRead := 0
+
+	for totalRead < want {
+		if r.currMsg == nil || r.currMsg.done {
+			_, err = sr.Read(nil)
+			if err != nil {
+				if err == io.ErrUnexpectedEOF {
+					err = io.EOF
+				}
+				break
+			}
+			if r.checkCRC || r.chunkCRCPresent {
+				remN, remErr := sr.readFull(buf[totalRead:])
+				if totalRead == 0 {
+					state.release()
+					return nil, remN, nil, remErr
+				}
+				if remN > 0 {
+					endBuf := totalRead + remN
+					state.slices = append(state.slices, buf[totalRead:endBuf:endBuf])
+					totalRead += remN
+				}
+				err = remErr
+				break
+			}
+			if r.currMsg == nil || r.currMsg.done {
+				continue
+			}
+		}
+
+		databufs := r.currMsg.databufs
+		offsets, ok := r.currMsg.dataOffsets[defaultReadID]
+		if !ok || len(databufs) == 0 {
+			r.currMsg.done = true
+			r.currMsg.databufs.Free()
+			r.currMsg.databufs = nil
+			continue
+		}
+
+		var msgRead int64
+		for totalRead < want {
+			if offsets.currBuf >= len(databufs) || (offsets.currBuf == offsets.endBuf && offsets.currOff >= offsets.endOff) {
+				r.currMsg.done = true
+				r.currMsg.databufs.Free()
+				r.currMsg.databufs = nil
+				break
+			}
+			databuf := databufs[offsets.currBuf]
+			raw := databuf.ReadOnlyData()
+			start := offsets.currOff
+			end := uint64(len(raw))
+			if offsets.currBuf == offsets.endBuf && offsets.endOff < end {
+				end = offsets.endOff
+			}
+
+			if end > start {
+				avail := int(end - start)
+				need := want - totalRead
+				take := avail
+				if take > need {
+					take = need
+				}
+				databuf.Ref()
+				state.held = append(state.held, databuf)
+				endOff := start + uint64(take)
+				state.slices = append(state.slices, raw[start:endOff:endOff])
+				totalRead += take
+				msgRead += int64(take)
+				offsets.currOff += uint64(take)
+			}
+
+			if offsets.currBuf != offsets.endBuf && offsets.currOff >= uint64(len(raw)) {
+				offsets.currOff = 0
+				offsets.currBuf++
+			}
+			if offsets.currBuf >= len(databufs) || (offsets.currBuf == offsets.endBuf && (offsets.currOff >= offsets.endOff || offsets.currOff >= uint64(len(raw)))) {
+				r.currMsg.done = true
+				r.currMsg.databufs.Free()
+				r.currMsg.databufs = nil
+				break
+			}
+		}
+
+		r.currMsg.dataOffsets[defaultReadID] = offsets
+		if msgRead > 0 {
+			r.seen += msgRead
+			sr.recordRead(msgRead, nil)
+		}
+	}
+
+	if totalRead == 0 {
+		state.release()
+		return nil, 0, nil, err
+	}
+	return state.slices[:len(state.slices):len(state.slices)], totalRead, state.callback, err
 }
 
 // recv attempts to Recv the next message on the stream and extract the object
@@ -2129,14 +2247,15 @@ func (d *readResponseDecoder) readAndUpdateCRC(p []byte, readID int64, updateCRC
 	}
 	offsets.currOff += uint64(n)
 
-	// We've read all the data for this specific range from this message.
-	if offsets.currBuf == offsets.endBuf && offsets.currOff == offsets.endOff {
-		d.done = true // Mark as done for this read, though the overall message might have more data.
-	}
 	// We are at the end of the current buffer for this range.
 	if offsets.currBuf != offsets.endBuf && offsets.currOff == uint64(databuf.Len()) {
 		offsets.currOff = 0
 		offsets.currBuf++
+	}
+
+	// We've read all the data for this specific range from this message.
+	if offsets.currBuf == offsets.endBuf && offsets.currOff == offsets.endOff {
+		d.done = true // Mark as done for this read, though the overall message might have more data.
 	}
 
 	// Update the map with the new offsets.
@@ -2203,6 +2322,8 @@ func (d *readResponseDecoder) writeToAndUpdateCRC(w io.Writer, readID int64, upd
 		return 0, false, nil
 	}
 
+	zcw, isZeroCopy := w.(ZeroCopyWriter)
+
 	// Loop from the current buffer to the ending buffer for this specific data range.
 	for i := offsets.currBuf; i <= offsets.endBuf; i++ {
 		if i < 0 || i >= len(d.databufs) {
@@ -2222,10 +2343,16 @@ func (d *readResponseDecoder) writeToAndUpdateCRC(w io.Writer, readID int64, upd
 			continue
 		}
 
-		dataSlice := databuf.ReadOnlyData()[start:end]
+		raw := databuf.ReadOnlyData()
+		dataSlice := raw[start:end:end]
 
 		// Write the data slice to the user's writer.
-		n, err := w.Write(dataSlice)
+		var n int
+		if isZeroCopy {
+			n, err = zcw.WriteZeroCopy(dataSlice, databuf)
+		} else {
+			n, err = w.Write(dataSlice)
+		}
 		totalWritten += int64(n)
 		offsets.currOff = 0 // moving to the next buffer, currOff resets to zero.
 		if updateCRC != nil {
